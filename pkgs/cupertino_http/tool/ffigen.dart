@@ -8,7 +8,10 @@ import 'package:ffigen/ffigen.dart';
 
 FfiGenerator getConfig(Uri packageRoot) {
   const headers = [
+    'NSURLAuthenticationChallenge.h',
     'NSURLCache.h',
+    'NSURLCredential.h',
+    'NSURLProtectionSpace.h',
     'NSURLRequest.h',
     'NSURLSession.h',
     'NSURL.h',
@@ -45,13 +48,18 @@ FfiGenerator getConfig(Uri packageRoot) {
             'NSHTTPURLResponse',
             'NSMutableURLRequest',
             'NSOperationQueue',
+            'NSURLAuthenticationChallenge',
             'NSURLCache',
+            'NSURLCredential',
+            'NSURLProtectionSpace',
             'NSURLRequest',
             'NSURLResponse',
             'NSURLSession',
             'NSURLSessionConfiguration',
             'NSURLSessionDownloadTask',
             'NSURLSessionTask',
+            'NSURLSessionTaskMetrics',
+            'NSURLSessionTaskTransactionMetrics',
             'NSURLSessionWebSocketMessage',
             'NSURLSessionWebSocketTask',
           };
@@ -65,11 +73,57 @@ FfiGenerator getConfig(Uri packageRoot) {
           };
           node.isIncluded = included.contains(node.originalName);
         },
+        func: (node) {
+          // The minimal set of Security functions needed to inspect and
+          // evaluate `NSURLProtectionSpace.serverTrust`.
+          const included = {
+            'SecCertificateCopyData',
+            'SecCertificateCopySubjectSummary',
+            'SecCertificateCreateWithData',
+            'SecTrustCopyCertificateChain',
+            'SecTrustEvaluateWithError',
+            'SecTrustGetNetworkFetchAllowed',
+            'SecTrustSetAnchorCertificates',
+            'SecTrustSetAnchorCertificatesOnly',
+            'SecTrustSetNetworkFetchAllowed',
+          };
+          node.isIncluded = included.contains(node.originalName);
+        },
+        global: (node) {
+          const included = {
+            'NSURLAuthenticationMethodClientCertificate',
+            'NSURLAuthenticationMethodDefault',
+            'NSURLAuthenticationMethodHTMLForm',
+            'NSURLAuthenticationMethodHTTPBasic',
+            'NSURLAuthenticationMethodHTTPDigest',
+            'NSURLAuthenticationMethodNegotiate',
+            'NSURLAuthenticationMethodNTLM',
+            'NSURLAuthenticationMethodServerTrust',
+          };
+          node.isIncluded = included.contains(node.originalName);
+        },
+        typealias: (node) {
+          // The underlying opaque structs (e.g. `__SecTrust`) are private in
+          // the generated bindings so generate public typedefs that can be
+          // named in `cupertino_api.dart`.
+          const included = {
+            'CFArrayRef',
+            'CFDataRef',
+            'CFErrorRef',
+            'SecCertificateRef',
+            'SecTrustRef',
+          };
+          if (included.contains(node.originalName)) {
+            node.isIncluded = TypealiasInclude.always;
+          }
+        },
         enumClass: (node) {
           const included = {
             'NSHTTPCookieAcceptPolicy',
+            'NSURLCredentialPersistence',
             'NSURLRequestCachePolicy',
             'NSURLRequestNetworkServiceType',
+            'NSURLSessionAuthChallengeDisposition',
             'NSURLSessionMultipathServiceType',
             'NSURLSessionResponseDisposition',
             'NSURLSessionTaskState',

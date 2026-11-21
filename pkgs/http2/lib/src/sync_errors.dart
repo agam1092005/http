@@ -2,6 +2,8 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
+import '../transport.dart';
+
 class ProtocolException implements Exception {
   final String _message;
 
@@ -39,32 +41,61 @@ class HeaderBlockProcessingException implements Exception {
   String toString() => 'HeaderBlockProcessingException: $_message';
 }
 
+/// The peer is exhibiting a behavior that might be generating excessive load
+/// (RFC 9113 section 7, `ENHANCE_YOUR_CALM`).
+class EnhanceYourCalmException implements Exception {
+  final String _message;
+
+  EnhanceYourCalmException(this._message);
+
+  @override
+  String toString() => 'EnhanceYourCalmException: $_message';
+}
+
 class TerminatedException implements Exception {
   @override
   String toString() => 'TerminatedException: The object has been terminated.';
 }
 
-class StreamException implements Exception {
-  final String _message;
+class StreamException extends StreamTransportException {
   final int streamId;
+  final String _details;
 
-  StreamException(this.streamId, this._message);
+  StreamException(this.streamId, String details)
+    : _details = details,
+      super(details);
 
   @override
-  String toString() => 'StreamException(stream id: $streamId): $_message';
+  String toString() => 'StreamException(stream id: $streamId): $_details';
 }
 
 class StreamClosedException extends StreamException {
-  StreamClosedException(super.streamId, [super.message = '']);
+  StreamClosedException(super.streamId, [super.details = '']);
 
   @override
-  String toString() => 'StreamClosedException(stream id: $streamId): $_message';
+  String toString() => 'StreamClosedException(stream id: $streamId): $_details';
 }
 
 class StreamRefusedException extends StreamException {
-  StreamRefusedException(super.streamId, [super.message = '']);
+  StreamRefusedException(super.streamId, [super.details = '']);
 
   @override
   String toString() =>
-      'StreamRefusedException(stream id: $streamId): $_message';
+      'StreamRefusedException(stream id: $streamId): $_details';
+}
+
+class StreamProtocolException extends StreamException {
+  StreamProtocolException(super.streamId, [super.details = '']);
+
+  @override
+  String toString() =>
+      'StreamProtocolException(stream id: $streamId): $_details';
+}
+
+class StreamFlowControlException extends StreamException {
+  StreamFlowControlException(super.streamId, [super.details = '']);
+
+  @override
+  String toString() =>
+      'StreamFlowControlException(stream id: $streamId): $_details';
 }

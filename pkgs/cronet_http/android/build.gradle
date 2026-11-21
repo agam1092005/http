@@ -20,7 +20,6 @@ if (project.hasProperty('dart-defines')) {
 }
 
 apply plugin: 'com.android.library'
-apply plugin: 'kotlin-android'
 
 android {
     // Conditional for compatibility with AGP <4.2.
@@ -32,12 +31,8 @@ android {
     compileSdkVersion 35
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_11
-        targetCompatibility JavaVersion.VERSION_11
-    }
-
-    kotlinOptions {
-        jvmTarget = '11'
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 
     sourceSets {
@@ -63,10 +58,26 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
 dependencies {
     if (dartDefines.cronetHttpNoPlay == 'true') {
         implementation 'org.chromium.net:cronet-embedded:143.7445.0'
     } else {
+        // TODO: When upgrading, check whether the pin to
+        // org.chromium.net:cronet-api:143.7445.0 is still necessary.
         implementation "com.google.android.gms:play-services-cronet:18.1.1"
+        // `play-services-cronet:18.1.1` depends on `cronet-api:141.7340.3`.
+        // That version of `cronet-api`, and its `cronet-shared` dependency,
+        // both use the "org.chromium.net" namespace, which breaks builds that
+        // set `android.uniquePackageNames=true` (the default starting with
+        // Android Gradle Plugin 9).
+        //
+        // See https://github.com/dart-lang/http/issues/1932
+        implementation 'org.chromium.net:cronet-api:143.7445.0'
     }
 }

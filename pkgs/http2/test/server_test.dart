@@ -5,10 +5,12 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:http2/src/connection.dart' show Connection;
 import 'package:http2/src/connection_preface.dart';
 import 'package:http2/src/frames/frames.dart';
 import 'package:http2/src/hpack/hpack.dart';
 import 'package:http2/src/settings/settings.dart';
+import 'package:http2/src/streams/stream_handler.dart' show StreamHandler;
 import 'package:http2/src/sync_errors.dart';
 import 'package:http2/transport.dart';
 import 'package:test/test.dart';
@@ -524,6 +526,667 @@ void main() {
           expect(await incoming, isEmpty);
         },
       );
+
+      serverTest(
+        'terminates a peer that does not read the acknowledgements of its '
+        'pings',
+        (
+          ServerTransportConnection server,
+          FrameWriter clientWriter,
+          StreamIterator<Frame> clientReader,
+          Future<Frame> Function() nextFrame,
+        ) async {
+          final queued = await expectTerminatedWhileNotReading(
+            server,
+            clientWriter,
+            clientReader,
+            nextFrame,
+            () {
+              for (var i = 0; i <= FrameWriter.maxQueuedReplyFrames; i++) {
+                clientWriter.writePingFrame(i);
+              }
+            },
+          );
+          expect(queued, hasLength(FrameWriter.maxQueuedReplyFrames));
+          expect(
+            queued,
+            everyElement(
+              isA<PingFrame>().having((f) => f.hasAckFlag, 'hasAckFlag', true),
+            ),
+          );
+        },
+      );
+
+      serverTest(
+        'terminates a peer that does not read the acknowledgements of its '
+        'settings',
+        (
+          ServerTransportConnection server,
+          FrameWriter clientWriter,
+          StreamIterator<Frame> clientReader,
+          Future<Frame> Function() nextFrame,
+        ) async {
+          final queued = await expectTerminatedWhileNotReading(
+            server,
+            clientWriter,
+            clientReader,
+            nextFrame,
+            () {
+              for (var i = 0; i <= FrameWriter.maxQueuedReplyFrames; i++) {
+                clientWriter.writeSettingsFrame([]);
+              }
+            },
+          );
+          expect(queued, hasLength(FrameWriter.maxQueuedReplyFrames));
+          expect(
+            queued,
+            everyElement(
+              isA<SettingsFrame>().having(
+                (f) => f.hasAckFlag,
+                'hasAckFlag',
+                true,
+              ),
+            ),
+          );
+        },
+      );
+
+      serverTest(
+        'terminates a peer that does not read the RST_STREAM frames sent in '
+        'reply to its frames',
+        (
+          ServerTransportConnection server,
+          FrameWriter clientWriter,
+          StreamIterator<Frame> clientReader,
+          Future<Frame> Function() nextFrame,
+        ) async {
+          final queued = await expectTerminatedWhileNotReading(
+            server,
+            clientWriter,
+            clientReader,
+            nextFrame,
+            () {
+              // Every DATA frame on the closed stream 3 is a stream error of
+              // type STREAM_CLOSED (RFC 9113 section 6.1), even an empty one,
+              // which uses no flow-control window.
+              clientWriter
+                ..writeHeadersFrame(3, [
+                  Header.ascii('a', 'b'),
+                ], endStream: false)
+                ..writeRstStreamFrame(3, ErrorCode.CANCEL);
+              for (var i = 0; i <= FrameWriter.maxQueuedReplyFrames; i++) {
+                clientWriter.writeDataFrame(3, const []);
+              }
+            },
+          );
+          expect(queued, hasLength(FrameWriter.maxQueuedReplyFrames));
+          expect(
+            queued,
+            everyElement(
+              isA<RstStreamFrame>()
+                  .having((f) => f.header.streamId, 'header.streamId', 3)
+                  .having(
+                    (f) => f.errorCode,
+                    'errorCode',
+                    ErrorCode.STREAM_CLOSED,
+                  ),
+            ),
+          );
+        },
+      );
+
+      serverTest(
+        'terminates a peer that resets the streams it opens too fast',
+        (
+          ServerTransportConnection server,
+          FrameWriter clientWriter,
+          StreamIterator<Frame> clientReader,
+          Future<Frame> Function() nextFrame,
+        ) async {
+          // Twice the burst: the bucket refills by just 33 per second while the
+          // server handles them.
+          const resets = 2 * StreamHandler.maxPeerStreamResetBurst;
+
+          Future serverFun() async {
+            var streams = 0;
+            await for (final _ in server.incomingStreams) {
+              // Only reached if the server let the peer reset all its streams.
+              if (++streams == resets) unawaited(server.terminate());
+            }
+          }
+
+          Future clientFun() async {
+            expect(await nextFrame(), isA<SettingsFrame>());
+            clientWriter.writeSettingsAckFrame();
+            clientWriter.writeSettingsFrame([]);
+            expect(await nextFrame(), isA<SettingsFrame>());
+
+            for (var i = 0; i < resets; i++) {
+              final streamId = 2 * i + 1;
+              clientWriter
+                ..writeHeadersFrame(streamId, [
+                  Header.ascii('a', 'b'),
+                ], endStream: false)
+                ..writeRstStreamFrame(streamId, ErrorCode.CANCEL);
+            }
+            expect(
+              await nextFrame(),
+              isA<GoawayFrame>().having(
+                (f) => f.errorCode,
+                'errorCode',
+                ErrorCode.ENHANCE_YOUR_CALM,
+              ),
+            );
+            expect(await clientReader.moveNext(), isFalse);
+          }
+
+          await Future.wait([serverFun(), clientFun()]);
+        },
+      );
+
+      serverTest(
+        'terminates a peer that makes this endpoint reset the streams it opens '
+        'too fast',
+        (
+          ServerTransportConnection server,
+          FrameWriter clientWriter,
+          StreamIterator<Frame> clientReader,
+          Future<Frame> Function() nextFrame,
+        ) async {
+          const resets = 2 * StreamHandler.maxPeerStreamResetBurst;
+          final terminatedErrorCodes = <int?>[];
+
+          Future serverFun() async {
+            var streams = 0;
+            await for (final stream in server.incomingStreams) {
+              stream.onTerminated = terminatedErrorCodes.add;
+              // Only reached if the server let the peer reset all its streams.
+              if (++streams == resets) unawaited(server.terminate());
+            }
+          }
+
+          Future clientFun() async {
+            expect(await nextFrame(), isA<SettingsFrame>());
+            clientWriter.writeSettingsAckFrame();
+            clientWriter.writeSettingsFrame([]);
+            expect(await nextFrame(), isA<SettingsFrame>());
+
+            // Open each stream half-closed (END_STREAM) and then send a DATA
+            // frame on it: a stream error of type STREAM_CLOSED (RFC 9113
+            // section 5.1) that makes the server reset the stream with
+            // RST_STREAM ("MadeYouReset", CVE-2025-8671). Read the replies so
+            // maxQueuedReplyFrames is never reached.
+            Frame? terminal;
+            for (var i = 0; i < resets && terminal == null; i++) {
+              final streamId = 2 * i + 1;
+              clientWriter
+                ..writeHeadersFrame(streamId, [
+                  Header.ascii('a', 'b'),
+                ], endStream: true)
+                ..writeDataFrame(streamId, const []);
+              final reply = await nextFrame();
+              if (reply is GoawayFrame) {
+                terminal = reply;
+              } else {
+                expect(
+                  reply,
+                  isA<RstStreamFrame>().having(
+                    (f) => f.errorCode,
+                    'errorCode',
+                    ErrorCode.STREAM_CLOSED,
+                  ),
+                );
+              }
+            }
+            terminal ??= await nextFrame();
+            expect(
+              terminal,
+              isA<GoawayFrame>().having(
+                (f) => f.errorCode,
+                'errorCode',
+                ErrorCode.ENHANCE_YOUR_CALM,
+              ),
+            );
+            expect(await clientReader.moveNext(), isFalse);
+            expect(terminatedErrorCodes, isNotEmpty);
+            expect(terminatedErrorCodes, everyElement(ErrorCode.STREAM_CLOSED));
+          }
+
+          await Future.wait([serverFun(), clientFun()]);
+        },
+      );
+
+      serverTest(
+        'counts peer streams whose response is blocked on a zero window',
+        (
+          ServerTransportConnection server,
+          FrameWriter clientWriter,
+          StreamIterator<Frame> clientReader,
+          Future<Frame> Function() nextFrame,
+        ) async {
+          Future serverFun() async {
+            await for (final stream in server.incomingStreams) {
+              await stream.incomingMessages.drain<void>();
+              stream
+                ..sendHeaders([Header.ascii(':status', '200')])
+                ..sendData([1, 2, 3, 4, 5], endStream: true);
+            }
+          }
+
+          Future clientFun() async {
+            try {
+              expect(await nextFrame(), isA<SettingsFrame>());
+              clientWriter.writeSettingsAckFrame();
+              // Zero initial window: the server can send HEADERS, but its
+              // END_STREAM DATA stays queued, so the streams remain half-closed
+              // (remote) on the wire (RFC 9113 section 5.1, CVE-2023-26964 /
+              // CVE-2023-45802).
+              clientWriter.writeSettingsFrame([
+                Setting(Setting.SETTINGS_INITIAL_WINDOW_SIZE, 0),
+              ]);
+              expect(await nextFrame(), isA<SettingsFrame>());
+
+              for (final streamId in [1, 3]) {
+                clientWriter.writeHeadersFrame(streamId, [
+                  Header.ascii('a', 'b'),
+                ], endStream: true);
+                expect(
+                  await nextFrame(),
+                  isA<HeadersFrame>().having(
+                    (f) => f.header.streamId,
+                    'header.streamId',
+                    streamId,
+                  ),
+                );
+              }
+
+              // Stream 5 exceeds concurrentStreamLimit (2) because streams 1
+              // and 3 have not sent END_STREAM yet.
+              clientWriter.writeHeadersFrame(5, [
+                Header.ascii('a', 'b'),
+              ], endStream: true);
+              expect(
+                await nextFrame(),
+                isA<RstStreamFrame>()
+                    .having((f) => f.header.streamId, 'header.streamId', 5)
+                    .having(
+                      (f) => f.errorCode,
+                      'errorCode',
+                      ErrorCode.REFUSED_STREAM,
+                    ),
+              );
+
+              // Granting window credit to stream 1 lets its END_STREAM DATA go
+              // out, freeing a slot for stream 7.
+              clientWriter.writeWindowUpdate(5, streamId: 1);
+              expect(
+                await nextFrame(),
+                isA<DataFrame>()
+                    .having((f) => f.header.streamId, 'header.streamId', 1)
+                    .having(
+                      (f) => f.hasEndStreamFlag,
+                      'hasEndStreamFlag',
+                      isTrue,
+                    ),
+              );
+
+              clientWriter.writeHeadersFrame(7, [
+                Header.ascii('a', 'b'),
+              ], endStream: true);
+              expect(
+                await nextFrame(),
+                isA<HeadersFrame>().having(
+                  (f) => f.header.streamId,
+                  'header.streamId',
+                  7,
+                ),
+              );
+            } finally {
+              unawaited(server.terminate());
+            }
+            while (await clientReader.moveNext()) {}
+          }
+
+          await Future.wait([serverFun(), clientFun()]);
+        },
+        serverSettings: const ServerSettings(concurrentStreamLimit: 2),
+      );
+
+      serverTest(
+        'sends empty end-stream DATA when the peer stream window is negative',
+        (
+          ServerTransportConnection server,
+          FrameWriter clientWriter,
+          StreamIterator<Frame> clientReader,
+          Future<Frame> Function() nextFrame,
+        ) async {
+          final shrunkWindow = Completer<void>();
+
+          Future serverFun() async {
+            try {
+              final streams = StreamIterator(server.incomingStreams);
+              expect(await streams.moveNext(), isTrue);
+              final stream = streams.current;
+              await stream.incomingMessages.drain<void>();
+              stream
+                ..sendHeaders([Header.ascii(':status', '200')])
+                ..sendData([1, 2, 3, 4, 5]);
+              await shrunkWindow.future;
+              // Closing outgoingMessages sends a 0-byte DATA frame with
+              // END_STREAM, which RFC 9113 section 6.9.1 permits even when the
+              // send window is zero or negative.
+              await stream.outgoingMessages.close();
+              await server.finish();
+            } catch (_) {
+              unawaited(server.terminate());
+              rethrow;
+            }
+          }
+
+          Future clientFun() async {
+            expect(await nextFrame(), isA<SettingsFrame>());
+            clientWriter.writeSettingsAckFrame();
+            clientWriter.writeSettingsFrame([
+              Setting(Setting.SETTINGS_INITIAL_WINDOW_SIZE, 5),
+            ]);
+            expect(await nextFrame(), isA<SettingsFrame>());
+
+            clientWriter.writeHeadersFrame(1, [
+              Header.ascii('a', 'b'),
+            ], endStream: true);
+            expect(await nextFrame(), isA<HeadersFrame>());
+            expect(await nextFrame(), isA<DataFrame>());
+
+            // Lowering SETTINGS_INITIAL_WINDOW_SIZE to 0 makes stream 1's send
+            // window -5 (RFC 9113 section 6.9.2).
+            clientWriter.writeSettingsFrame([
+              Setting(Setting.SETTINGS_INITIAL_WINDOW_SIZE, 0),
+            ]);
+            expect(await nextFrame(), isA<SettingsFrame>());
+            shrunkWindow.complete();
+
+            expect(
+              await nextFrame(),
+              isA<DataFrame>()
+                  .having((f) => f.bytes, 'bytes', isEmpty)
+                  .having(
+                    (f) => f.hasEndStreamFlag,
+                    'hasEndStreamFlag',
+                    isTrue,
+                  ),
+            );
+            expect(
+              await nextFrame(),
+              isA<GoawayFrame>().having(
+                (f) => f.errorCode,
+                'errorCode',
+                ErrorCode.NO_ERROR,
+              ),
+            );
+            expect(await clientReader.moveNext(), isFalse);
+          }
+
+          await Future.wait([serverFun(), clientFun()]);
+        },
+      );
+
+      serverTest(
+        'enforces connection flow control on ignored DATA and does not inflate '
+        'the receive window',
+        (
+          ServerTransportConnection server,
+          FrameWriter clientWriter,
+          StreamIterator<Frame> clientReader,
+          Future<Frame> Function() nextFrame,
+        ) async {
+          final sub = server.incomingStreams.listen((_) {});
+          expect(await nextFrame(), isA<SettingsFrame>());
+          clientWriter.writeSettingsAckFrame();
+          clientWriter.writeSettingsFrame([]);
+          expect(await nextFrame(), isA<SettingsFrame>());
+
+          // Ignored DATA on non-existent stream 3 is replenished, so the
+          // connection window stays 65535 - it must not grow to 65535 + 10000.
+          clientWriter.writeDataFrame(3, List<int>.filled(10000, 0));
+          expect(await nextFrame(), isA<WindowUpdateFrame>());
+          expect(await nextFrame(), isA<RstStreamFrame>());
+
+          // Open stream 1 without reading its incomingMessages, then send
+          // 65536 bytes (> 65535 connection window) across frames.
+          clientWriter
+            ..writeHeadersFrame(1, [Header.ascii('a', 'b')], endStream: false)
+            ..writeDataFrame(1, List<int>.filled(16384, 0))
+            ..writeDataFrame(1, List<int>.filled(16384, 0))
+            ..writeDataFrame(1, List<int>.filled(16384, 0))
+            ..writeDataFrame(1, List<int>.filled(16384, 0));
+          final frameFuture = nextFrame();
+          await pumpEventQueue();
+          // Only reached if the server inflated its receive window above 65535.
+          unawaited(server.terminate());
+
+          expect(
+            await frameFuture,
+            isA<GoawayFrame>().having(
+              (f) => f.errorCode,
+              'errorCode',
+              ErrorCode.FLOW_CONTROL_ERROR,
+            ),
+          );
+          await sub.cancel();
+        },
+      );
+
+      test('counts DATA padding toward flow control and checks stream window '
+          'while paused', () async {
+        final streams = ClientErrorStreams(
+          const ServerSettings(streamWindowSize: 100),
+        );
+        final server = streams.serverConnection;
+        final sub = server.incomingStreams.listen((_) {});
+        final clientReader = streams.clientConnectionFrameReader;
+
+        Future<Frame> nextFrame() async {
+          expect(await clientReader.moveNext(), isTrue);
+          return clientReader.current;
+        }
+
+        streams.writeConnectionPreface();
+        expect(await nextFrame(), isA<SettingsFrame>());
+        streams.writeRawFrame(
+          type: FrameType.SETTINGS,
+          flags: SettingsFrame.FLAG_ACK,
+          streamId: 0,
+          payload: const [],
+        );
+        streams.writeRawFrame(
+          type: FrameType.SETTINGS,
+          flags: 0,
+          streamId: 0,
+          payload: const [],
+        );
+        expect(await nextFrame(), isA<SettingsFrame>());
+
+        // Open stream 1 without reading its incomingMessages, then send a
+        // padded 0-data DATA frame whose 1-byte Pad Length + 100 pad bytes
+        // (101 bytes total) exceed the 100-byte stream window (RFC 9113
+        // section 6.1).
+        final frameFuture = nextFrame();
+        streams.writeRawFrame(
+          type: FrameType.HEADERS,
+          flags: HeadersFrame.FLAG_END_HEADERS,
+          streamId: 1,
+          payload: HPackEncoder().encode([Header.ascii('a', 'b')]),
+        );
+        streams.writeRawFrame(
+          type: FrameType.DATA,
+          flags: DataFrame.FLAG_PADDED,
+          streamId: 1,
+          payload: [100, ...List<int>.filled(100, 0)],
+        );
+        await pumpEventQueue();
+        unawaited(server.terminate());
+
+        expect(
+          await frameFuture,
+          isA<GoawayFrame>().having(
+            (f) => f.errorCode,
+            'errorCode',
+            ErrorCode.FLOW_CONTROL_ERROR,
+          ),
+        );
+        await sub.cancel();
+      });
+
+      serverTest('rejects a SETTINGS frame with too many entries', (
+        ServerTransportConnection server,
+        FrameWriter clientWriter,
+        StreamIterator<Frame> clientReader,
+        Future<Frame> Function() nextFrame,
+      ) async {
+        final sub = server.incomingStreams.listen((_) {});
+        expect(await nextFrame(), isA<SettingsFrame>());
+        clientWriter.writeSettingsAckFrame();
+        clientWriter.writeSettingsFrame([]);
+        expect(await nextFrame(), isA<SettingsFrame>());
+
+        // CVE-2020-11080: a single SETTINGS frame carrying more than
+        // maxSettingsPerFrame entries is rejected with ENHANCE_YOUR_CALM.
+        clientWriter.writeSettingsFrame(
+          List<Setting>.filled(
+            SettingsHandler.maxSettingsPerFrame + 1,
+            Setting(Setting.SETTINGS_INITIAL_WINDOW_SIZE, 65535),
+          ),
+        );
+        expect(
+          await nextFrame(),
+          isA<GoawayFrame>().having(
+            (f) => f.errorCode,
+            'errorCode',
+            ErrorCode.ENHANCE_YOUR_CALM,
+          ),
+        );
+        await sub.cancel();
+      });
+
+      serverTest(
+        'terminates a peer that floods control frames while reading replies',
+        (
+          ServerTransportConnection server,
+          FrameWriter clientWriter,
+          StreamIterator<Frame> clientReader,
+          Future<Frame> Function() nextFrame,
+        ) async {
+          const floodFrames = 2 * Connection.maxControlFrameBurst;
+          final sub = server.incomingStreams.listen((_) {});
+          expect(await nextFrame(), isA<SettingsFrame>());
+          clientWriter.writeSettingsAckFrame();
+          clientWriter.writeSettingsFrame([]);
+          expect(await nextFrame(), isA<SettingsFrame>());
+
+          // CVE-2019-9512: send non-ACK PING frames while draining every PING
+          // ACK so maxQueuedReplyFrames is never reached.
+          Frame? terminal;
+          for (var i = 0; i < floodFrames && terminal == null; i++) {
+            clientWriter.writePingFrame(i);
+            final reply = await nextFrame();
+            if (reply is GoawayFrame) {
+              terminal = reply;
+            } else {
+              expect(
+                reply,
+                isA<PingFrame>().having(
+                  (f) => f.hasAckFlag,
+                  'hasAckFlag',
+                  true,
+                ),
+              );
+            }
+          }
+          if (terminal == null) {
+            unawaited(server.terminate());
+            terminal = await nextFrame();
+          }
+          expect(
+            terminal,
+            isA<GoawayFrame>().having(
+              (f) => f.errorCode,
+              'errorCode',
+              ErrorCode.ENHANCE_YOUR_CALM,
+            ),
+          );
+          await sub.cancel();
+        },
+      );
+
+      serverTest(
+        'rejects zero WINDOW_UPDATE increments and scopes stream overflow to '
+        'the stream',
+        (
+          ServerTransportConnection server,
+          FrameWriter clientWriter,
+          StreamIterator<Frame> clientReader,
+          Future<Frame> Function() nextFrame,
+        ) async {
+          final sub = server.incomingStreams.listen((_) {});
+          expect(await nextFrame(), isA<SettingsFrame>());
+          clientWriter.writeSettingsAckFrame();
+          clientWriter.writeSettingsFrame([]);
+          expect(await nextFrame(), isA<SettingsFrame>());
+
+          clientWriter
+            ..writeHeadersFrame(1, [Header.ascii('a', 'b')], endStream: false)
+            ..writeHeadersFrame(3, [Header.ascii('a', 'b')], endStream: false)
+            ..writeHeadersFrame(5, [Header.ascii('a', 'b')], endStream: false);
+
+          // RFC 9113 section 6.9: zero increment on a stream is a stream error
+          // of type PROTOCOL_ERROR.
+          clientWriter
+            ..writeWindowUpdate(0, streamId: 1)
+            ..writePingFrame(1);
+          expect(
+            await nextFrame(),
+            isA<RstStreamFrame>()
+                .having((f) => f.header.streamId, 'header.streamId', 1)
+                .having(
+                  (f) => f.errorCode,
+                  'errorCode',
+                  ErrorCode.PROTOCOL_ERROR,
+                ),
+          );
+          expect(await nextFrame(), isA<PingFrame>());
+
+          // RFC 9113 section 6.9.1: overflowing a stream window (> 2^31 - 1)
+          // resets only that stream with FLOW_CONTROL_ERROR, leaving stream 5
+          // open.
+          clientWriter.writeWindowUpdate(0x7fffffff, streamId: 3);
+          expect(
+            await nextFrame(),
+            isA<RstStreamFrame>()
+                .having((f) => f.header.streamId, 'header.streamId', 3)
+                .having(
+                  (f) => f.errorCode,
+                  'errorCode',
+                  ErrorCode.FLOW_CONTROL_ERROR,
+                ),
+          );
+
+          // RFC 9113 section 6.9: zero increment on stream 0 is a connection
+          // error of type PROTOCOL_ERROR.
+          final frameFuture = nextFrame();
+          clientWriter.writeWindowUpdate(0, streamId: 0);
+          await pumpEventQueue();
+          unawaited(server.terminate());
+          expect(
+            await frameFuture,
+            isA<GoawayFrame>().having(
+              (f) => f.errorCode,
+              'errorCode',
+              ErrorCode.PROTOCOL_ERROR,
+            ),
+          );
+          await sub.cancel();
+        },
+      );
     });
 
     group('client-errors', () {
@@ -651,6 +1314,159 @@ void main() {
         }
 
         await Future.wait([serverFun(), clientFun()]);
+      });
+
+      test(
+        'ignores-priority-and-unknown-frames-on-open-and-idle-streams',
+        () async {
+          final streams = ClientErrorStreams();
+          final server = streams.serverConnection;
+          final clientReader = streams.clientConnectionFrameReader;
+          final encoder = HPackEncoder();
+
+          Future<Frame> nextFrame() async {
+            expect(await clientReader.moveNext(), isTrue);
+            return clientReader.current;
+          }
+
+          Future<void> serverFun() async {
+            final it = StreamIterator(server.incomingStreams);
+            expect(await it.moveNext(), isTrue);
+            final stream = it.current;
+            final messages = await stream.incomingMessages.toList();
+            expect(messages, hasLength(2));
+            expect(messages[0], isA<HeadersStreamMessage>());
+            expect(messages[1], isA<DataStreamMessage>());
+            stream.sendHeaders([
+              Header.ascii(':status', '200'),
+            ], endStream: true);
+            expect(await it.moveNext(), isFalse);
+            await server.finish();
+          }
+
+          Future<void> clientFun() async {
+            streams.writeConnectionPreface();
+            expect(await nextFrame(), isA<SettingsFrame>());
+            streams.writeRawFrame(
+              type: FrameType.SETTINGS,
+              flags: SettingsFrame.FLAG_ACK,
+              streamId: 0,
+              payload: const [],
+            );
+            streams.writeRawFrame(
+              type: FrameType.SETTINGS,
+              flags: 0,
+              streamId: 0,
+              payload: const [],
+            );
+            expect(await nextFrame(), isA<SettingsFrame>());
+
+            streams.writeRawFrame(
+              type: FrameType.HEADERS,
+              flags: HeadersFrame.FLAG_END_HEADERS,
+              streamId: 1,
+              payload: encoder.encode([Header.ascii('a', 'b')]),
+            );
+            // Send PRIORITY on open stream 1 and unknown frame (0xfa) on open
+            // stream 1 and idle stream 5.
+            streams.writeRawFrame(
+              type: FrameType.PRIORITY,
+              flags: 0,
+              streamId: 1,
+              payload: const [0, 0, 0, 0, 16],
+            );
+            streams.writeRawFrame(
+              type: 0xfa,
+              flags: 0,
+              streamId: 1,
+              payload: const [1, 2],
+            );
+            streams.writeRawFrame(
+              type: 0xfa,
+              flags: 0,
+              streamId: 5,
+              payload: const [],
+            );
+            streams.writeRawFrame(
+              type: FrameType.DATA,
+              flags: DataFrame.FLAG_END_STREAM,
+              streamId: 1,
+              payload: const [42],
+            );
+
+            expect(await nextFrame(), isA<WindowUpdateFrame>());
+            expect(await nextFrame(), isA<WindowUpdateFrame>());
+            expect(await nextFrame(), isA<HeadersFrame>());
+
+            streams.writeRawFrame(
+              type: FrameType.GOAWAY,
+              flags: 0,
+              streamId: 0,
+              payload: const [0, 0, 0, 1, 0, 0, 0, 0],
+            );
+            expect(await clientReader.moveNext(), isFalse);
+          }
+
+          await Future.wait([serverFun(), clientFun()]);
+        },
+      );
+
+      test('rejects-control-frames-with-nonzero-stream-id', () async {
+        for (final frameType in [
+          FrameType.SETTINGS,
+          FrameType.PING,
+          FrameType.GOAWAY,
+        ]) {
+          final streams = ClientErrorStreams();
+          final server = streams.serverConnection;
+          final incoming = server.incomingStreams.toList();
+          final clientReader = streams.clientConnectionFrameReader;
+
+          Future<Frame> nextFrame() async {
+            expect(await clientReader.moveNext(), isTrue);
+            return clientReader.current;
+          }
+
+          streams.writeConnectionPreface();
+          expect(await nextFrame(), isA<SettingsFrame>());
+          streams.writeRawFrame(
+            type: FrameType.SETTINGS,
+            flags: SettingsFrame.FLAG_ACK,
+            streamId: 0,
+            payload: const [],
+          );
+          streams.writeRawFrame(
+            type: FrameType.SETTINGS,
+            flags: 0,
+            streamId: 0,
+            payload: const [],
+          );
+          expect(await nextFrame(), isA<SettingsFrame>());
+
+          final payload = switch (frameType) {
+            FrameType.SETTINGS => const <int>[],
+            FrameType.PING => const <int>[0, 0, 0, 0, 0, 0, 0, 1],
+            FrameType.GOAWAY => const <int>[0, 0, 0, 0, 0, 0, 0, 0],
+            _ => const <int>[],
+          };
+          streams.writeRawFrame(
+            type: frameType,
+            flags: 0,
+            streamId: 1,
+            payload: payload,
+          );
+
+          expect(
+            await nextFrame(),
+            isA<GoawayFrame>().having(
+              (f) => f.errorCode,
+              'errorCode',
+              ErrorCode.PROTOCOL_ERROR,
+            ),
+          );
+          expect(await clientReader.moveNext(), isFalse);
+          expect(await incoming, isEmpty);
+        }
       });
     });
 
@@ -783,6 +1599,53 @@ void main() {
       });
     });
   });
+}
+
+/// Lets [flood] write frames to the server while the client reads nothing,
+/// and expects the server to terminate the connection with
+/// `ENHANCE_YOUR_CALM` rather than queue its replies without limit.
+///
+/// Returns the frames the server had queued, which are still delivered.
+Future<List<Frame>> expectTerminatedWhileNotReading(
+  ServerTransportConnection server,
+  FrameWriter clientWriter,
+  StreamIterator<Frame> clientReader,
+  Future<Frame> Function() nextFrame,
+  void Function() flood,
+) async {
+  expect(await nextFrame(), isA<SettingsFrame>());
+  clientWriter.writeSettingsAckFrame();
+  clientWriter.writeSettingsFrame([]);
+  expect(await nextFrame(), isA<SettingsFrame>());
+
+  // An open stream reports the error the connection is terminated with.
+  final streams = StreamIterator(server.incomingStreams);
+  clientWriter.writeHeadersFrame(1, [Header.ascii('a', 'b')], endStream: false);
+  expect(await streams.moveNext(), isTrue);
+  Object? error;
+  streams.current.incomingMessages.listen(
+    null,
+    onError: (Object e) => error = e,
+  );
+
+  // The client does not call `nextFrame()` until the server is done, so the
+  // server's frames cannot be written.
+  flood();
+  await pumpEventQueue();
+  expect(
+    error,
+    isA<TransportConnectionException>().having(
+      (e) => e.errorCode,
+      'errorCode',
+      ErrorCode.ENHANCE_YOUR_CALM,
+    ),
+  );
+
+  final queued = <Frame>[];
+  while (await clientReader.moveNext()) {
+    queued.add(clientReader.current);
+  }
+  return queued;
 }
 
 void serverTest(

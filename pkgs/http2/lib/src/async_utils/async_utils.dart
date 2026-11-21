@@ -3,6 +3,7 @@
 // BSD-style license that can be found in the LICENSE file.
 
 import 'dart:async';
+import 'dart:math';
 import 'dart:typed_data';
 
 /// An interface for `StreamSink`-like classes to indicate whether adding data
@@ -56,6 +57,13 @@ class BufferedSink {
   /// A future which completes once the sink has been closed.
   late final Future _doneFuture;
 
+  /// The number of chunks added to [sink] that the underlying sink has taken.
+  ///
+  /// The other chunks are buffered here, because the underlying sink is not
+  /// accepting more data.
+  int get chunksTaken => _chunksTaken;
+  int _chunksTaken = 0;
+
   BufferedSink(StreamSink<List<int>> dataSink) {
     bufferIndicator.markBuffered();
 
@@ -68,10 +76,25 @@ class BufferedSink {
         // Currently `_doneFuture` will just complete normally if the sink
         // cancelled.
       };
-    _doneFuture = Future.wait([
-      _controller.stream.pipe(dataSink),
-      dataSink.done,
-    ]);
+    // When `_controller` closes normally, `Stream.pipe` calls
+    // `dataSink.close()` and awaits its completion.
+    //
+    // Do not also await `dataSink.done`: if a write fails (e.g. the peer
+    // resets the socket), `addStream` throws and `Stream.pipe` returns without
+    // calling `dataSink.close()`. On a `dart:io` `Socket`, `done` never
+    // completes unless `close()` is called, which would hang
+    // `Connection.finish()` and `Connection.terminate()`.
+    //
+    // Swallow write errors so `doneFuture` completes normally (like when the
+    // sink cancels); `Connection` detects the broken transport via the
+    // incoming stream.
+    _doneFuture = _controller.stream
+        .map((chunk) {
+          _chunksTaken++;
+          return chunk;
+        })
+        .pipe(dataSink)
+        .catchError((Object _) {});
   }
 
   /// The underlying sink.
@@ -95,6 +118,14 @@ class BufferedBytesWriter {
   /// An indicator whether the underlying sink is buffering at the moment.
   BufferIndicator get bufferIndicator => _bufferedSink.bufferIndicator;
 
+  /// The number of chunks written to the underlying [BufferedSink].
+  int get chunksAdded => _chunksAdded;
+  int _chunksAdded = 0;
+
+  /// The number of those chunks the transport has taken; the others are
+  /// buffered (see [BufferedSink.chunksTaken]).
+  int get chunksTaken => _bufferedSink.chunksTaken;
+
   /// Adds [data] immediately to the underlying buffer.
   ///
   /// If there is buffered data which was added with [addBufferedData] and it
@@ -105,6 +136,7 @@ class BufferedBytesWriter {
         'Cannot trigger an asynchronous write while there is buffered data.',
       );
     }
+    _chunksAdded++;
     _bufferedSink.sink.add(data);
   }
 
@@ -116,6 +148,7 @@ class BufferedBytesWriter {
   /// Flushes all data which was enqueued by [addBufferedData].
   void flushBufferedData() {
     if (_builder.length > 0) {
+      _chunksAdded++;
       _bufferedSink.sink.add(_builder.takeBytes());
     }
   }
@@ -128,4 +161,31 @@ class BufferedBytesWriter {
 
   /// The future which will complete once this sink has been closed.
   Future get doneFuture => _bufferedSink.doneFuture;
+}
+
+/// A token bucket: lets through bursts of up to [_capacity] events, and
+/// `perSecond` events per second on average.
+class TokenBucket {
+  final int _capacity;
+  final int _microsPerToken;
+  final _clock = Stopwatch()..start();
+  int _lastRefillMicros = 0;
+  int _tokens;
+
+  TokenBucket(this._capacity, int perSecond)
+    : _microsPerToken = Duration.microsecondsPerSecond ~/ perSecond,
+      _tokens = _capacity;
+
+  /// Takes a token, or returns `false` if there is none left.
+  bool tryTake() {
+    final elapsedMicros = _clock.elapsedMicroseconds - _lastRefillMicros;
+    final refilled = elapsedMicros ~/ _microsPerToken;
+    if (refilled > 0) {
+      _tokens = min(_capacity, _tokens + refilled);
+      _lastRefillMicros += refilled * _microsPerToken;
+    }
+    if (_tokens == 0) return false;
+    _tokens--;
+    return true;
+  }
 }

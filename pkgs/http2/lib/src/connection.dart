@@ -6,6 +6,7 @@ import 'dart:async';
 import 'dart:convert' show utf8;
 
 import '../transport.dart';
+import 'async_utils/async_utils.dart';
 import 'connection_preface.dart';
 import 'flowcontrol/connection_queues.dart';
 import 'flowcontrol/queue_messages.dart';
@@ -84,6 +85,23 @@ class ConnectionState {
 }
 
 abstract class Connection {
+  /// The most control or empty frames (non-ACK `PING`, non-ACK `SETTINGS`,
+  /// `PRIORITY`, unknown extension frames, and unpadded 0-byte `DATA` without
+  /// `END_STREAM`) a peer may send at once, and the rate at which that
+  /// allowance refills (RFC 9113 section 10.5, CVE-2019-9512, CVE-2019-9513,
+  /// CVE-2019-9515, CVE-2019-9518).
+  ///
+  /// 10,000 burst and 330 per second match [nghttp2's][nghttp2]
+  /// `NGHTTP2_DEFAULT_GLITCH_BURST` and `NGHTTP2_DEFAULT_GLITCH_RATE` (10x
+  /// [StreamHandler.maxPeerStreamResetBurst] and
+  /// [StreamHandler.peerStreamResetsPerSecond]); Envoy
+  /// (`DEFAULT_MAX_OUTBOUND_FRAMES`) and Netty
+  /// (`DEFAULT_MAX_QUEUED_CONTROL_FRAMES`) also cap frame floods at 10,000.
+  ///
+  /// [nghttp2]: https://github.com/nghttp2/nghttp2/blob/v1.71.0/lib/nghttp2_session.h#L106-L107
+  static const maxControlFrameBurst = 10000;
+  static const controlFramesPerSecond = 330;
+
   /// The settings the other end has acknowledged to use when communicating with
   /// us.
   final ActiveSettings acknowledgedSettings = ActiveSettings();
@@ -152,6 +170,11 @@ abstract class Connection {
   /// The state of this connection.
   late ConnectionState _state;
 
+  final _peerControlFrames = TokenBucket(
+    maxControlFrameBurst,
+    controlFramesPerSecond,
+  );
+
   Connection(
     Stream<List<int>> incoming,
     StreamSink<List<int>> outgoing,
@@ -218,6 +241,23 @@ abstract class Connection {
 
     var settings = _decodeSettings(settingsObject);
 
+    // A larger initial stream window and the frame size bound what this end
+    // accepts from the moment they are sent, not from the peer's ACK: a peer
+    // that has not read them yet sends within the defaults, which both still
+    // allow, and one that has may already use them. Waiting for the ACK cost
+    // every early response a round trip. A smaller stream window waits for the
+    // ACK as before: a client may send on a stream before it has read the
+    // server's SETTINGS (RFC 9113 section 3.4), with the default 65535 bytes.
+    final streamWindowSize = settingsObject.streamWindowSize;
+    if (streamWindowSize != null &&
+        streamWindowSize >= acknowledgedSettings.initialWindowSize) {
+      acknowledgedSettings.initialWindowSize = streamWindowSize;
+    }
+    final maxFrameSize = settingsObject.maxFrameSize;
+    if (maxFrameSize != null) {
+      acknowledgedSettings.maxFrameSize = maxFrameSize;
+    }
+
     // Do the initial settings handshake (possibly with pushes disabled).
     _settingsHandler.changeSettings(settings).catchError((Object error) {
       // TODO: The [error] can contain sensitive information we now expose via
@@ -243,6 +283,14 @@ abstract class Connection {
       _frameWriter,
       _localWindow,
     );
+
+    // The connection window has no setting: grant a larger one with a
+    // WINDOW_UPDATE on stream 0, after the preface and the SETTINGS above.
+    final connectionWindowSize = settingsObject.connectionWindowSize;
+    if (connectionWindowSize != null &&
+        connectionWindowSize > _localWindow.size) {
+      connectionWindowUpdater.raise(connectionWindowSize - _localWindow.size);
+    }
 
     // Setup queues for outgoing/incoming messages on the connection level.
     _outgoingQueue = ConnectionMessageQueueOut(
@@ -305,6 +353,12 @@ abstract class Connection {
       settingsList.add(
         Setting(Setting.SETTINGS_INITIAL_WINDOW_SIZE, streamWindowSize),
       );
+    }
+
+    // By default the largest frame payload is 16 KiB.
+    var maxFrameSize = settings.maxFrameSize;
+    if (maxFrameSize != null) {
+      settingsList.add(Setting(Setting.SETTINGS_MAX_FRAME_SIZE, maxFrameSize));
     }
 
     final maxInboundHeaderListSize = settings.maxInboundHeaderListSize;
@@ -373,6 +427,8 @@ abstract class Connection {
       _terminate(ErrorCode.FRAME_SIZE_ERROR, message: '$error');
     } on HeaderBlockProcessingException catch (error) {
       _terminate(ErrorCode.ENHANCE_YOUR_CALM, message: '$error');
+    } on EnhanceYourCalmException catch (error) {
+      _terminate(ErrorCode.ENHANCE_YOUR_CALM, message: '$error');
     } on HPackDecodingException catch (error) {
       _terminate(ErrorCode.COMPRESSION_ERROR, message: '$error');
     } on TerminatedException {
@@ -388,7 +444,8 @@ abstract class Connection {
   void _handleFrameImpl(Frame? frame) {
     // The first frame from the other side must be a [SettingsFrame], otherwise
     // we terminate the connection.
-    if (_state.isInitialized) {
+    final isInitialSettings = _state.isInitialized;
+    if (isInitialSettings) {
       if (frame is! SettingsFrame) {
         _terminate(
           ErrorCode.PROTOCOL_ERROR,
@@ -403,6 +460,18 @@ abstract class Connection {
     // Try to defragment [frame] if it is a Headers/PushPromise frame.
     frame = _defragmenter.tryDefragmentFrame(frame);
     if (frame == null) return;
+
+    if (!isInitialSettings && _isRateLimitedControlOrEmptyFrame(frame)) {
+      if (!_peerControlFrames.tryTake()) {
+        // RFC 9113 section 10.5: "An endpoint MAY treat activity that is
+        // suspicious as a connection error (Section 5.4.1) of type
+        // ENHANCE_YOUR_CALM."
+        throw EnhanceYourCalmException(
+          'The peer sent more than $maxControlFrameBurst control or empty '
+          'frames at once, or more than $controlFramesPerSecond per second.',
+        );
+      }
+    }
 
     // Try to decode headers if it's a Headers/PushPromise frame.
     // [This needs to be done even if the frames get ignored, since the entire
@@ -446,10 +515,29 @@ abstract class Connection {
           'Cannot handle frame type ${frame.runtimeType} with stream-id 0.',
         );
       }
+    } else if (frame is SettingsFrame ||
+        frame is PingFrame ||
+        frame is GoawayFrame) {
+      // RFC 9113 sections 6.5, 6.7, and 6.8: SETTINGS, PING, and GOAWAY frames
+      // always apply to the connection as a whole; a non-zero stream identifier
+      // must be treated as a connection error of type PROTOCOL_ERROR.
+      throw ProtocolException(
+        'Cannot handle frame type ${frame.runtimeType} with non-zero '
+        'stream-id ${frame.header.streamId}.',
+      );
     } else {
       _streams.processStreamFrame(_state, frame);
     }
   }
+
+  static bool _isRateLimitedControlOrEmptyFrame(Frame frame) =>
+      (frame is PingFrame && !frame.hasAckFlag) ||
+      (frame is SettingsFrame && !frame.hasAckFlag) ||
+      frame is PriorityFrame ||
+      frame is UnknownFrame ||
+      (frame is DataFrame &&
+          !frame.hasEndStreamFlag &&
+          frame.flowControlledLength == 0);
 
   void _startInboundHeaderBlockTimer() {
     final timeout = _inboundHeaderBlockTimeout;
@@ -494,6 +582,33 @@ abstract class Connection {
         timeout,
         'inboundHeaderBlockTimeout',
         'must not be negative',
+      );
+    }
+    final maxFrameSize = settings.maxFrameSize;
+    if (maxFrameSize != null &&
+        (maxFrameSize < (1 << 14) || maxFrameSize >= (1 << 24))) {
+      throw ArgumentError.value(
+        maxFrameSize,
+        'maxFrameSize',
+        'must be between 16384 and 16777215',
+      );
+    }
+    final streamWindowSize = settings.streamWindowSize;
+    if (streamWindowSize != null &&
+        (streamWindowSize < 0 || streamWindowSize >= (1 << 31))) {
+      throw ArgumentError.value(
+        streamWindowSize,
+        'streamWindowSize',
+        'must be between 0 and 2147483647',
+      );
+    }
+    final connectionWindowSize = settings.connectionWindowSize;
+    if (connectionWindowSize != null &&
+        (connectionWindowSize < 65535 || connectionWindowSize >= (1 << 31))) {
+      throw ArgumentError.value(
+        connectionWindowSize,
+        'connectionWindowSize',
+        'must be between 65535 and 2147483647',
       );
     }
     final violations = settings.maxPeerStreamLimitViolations;

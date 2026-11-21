@@ -71,13 +71,12 @@ class StreamMessageQueueOut extends Object
   void enqueueMessage(Message message) {
     if (message is! ResetStreamMessage) ensureNotClosingSync(() {});
     if (!wasTerminated) {
-      if (message.endStream) startClosing();
-
       if (message is DataMessage) {
         toBeWrittenBytes += message.bytes.length;
       }
 
       _messages.addLast(message);
+      if (message.endStream) startClosing();
       _trySendData();
 
       if (_messages.isNotEmpty) {
@@ -115,7 +114,7 @@ class StreamMessageQueueOut extends Object
           var messageToSend = message;
           var messageBytes = message.bytes;
           // TODO: Do not fragment if the number of bytes we can send is too low
-          if (messageBytes.length > bytesAvailable) {
+          if (messageBytes.isNotEmpty && messageBytes.length > bytesAvailable) {
             var partA = viewOrSublist(messageBytes, 0, bytesAvailable);
             var partB = viewOrSublist(
               messageBytes,
@@ -209,6 +208,16 @@ class StreamMessageQueueIn extends Object
     };
   }
 
+  @override
+  void cancel() {
+    super.cancel();
+    if (!wasClosed && !wasTerminated) {
+      _tryDispatch();
+      _tryUpdateBufferIndicator();
+      onCloseCheck();
+    }
+  }
+
   /// Debugging data: the number of pending messages in this queue.
   int get pendingMessages => _pendingMessages.length;
 
@@ -235,9 +244,6 @@ class StreamMessageQueueIn extends Object
           return;
         }
 
-        if (message is DataMessage) {
-          windowHandler.gotData(message.bytes.length);
-        }
         _pendingMessages.add(message);
         if (message.endStream) startClosing();
 
@@ -317,7 +323,9 @@ class StreamMessageQueueIn extends Object
               _incomingMessagesC.add(
                 DataStreamMessage(message.bytes, endStream: message.endStream),
               );
-              windowHandler.dataProcessed(message.bytes.length);
+            }
+            if (message.flowControlledLength > 0) {
+              windowHandler.dataProcessed(message.flowControlledLength);
             }
           } else {
             // This can never happen.
@@ -337,9 +345,11 @@ class StreamMessageQueueIn extends Object
   }
 
   void _tryUpdateBufferIndicator() {
-    if (_incomingMessagesC.isPaused || _pendingMessages.isNotEmpty) {
+    if (!wasCancelled &&
+        (_incomingMessagesC.isPaused || _pendingMessages.isNotEmpty)) {
       bufferIndicator.markBuffered();
-    } else if (bufferIndicator.wouldBuffer && !_incomingMessagesC.isPaused) {
+    } else if (bufferIndicator.wouldBuffer &&
+        (wasCancelled || !_incomingMessagesC.isPaused)) {
       bufferIndicator.markUnBuffered();
     }
   }

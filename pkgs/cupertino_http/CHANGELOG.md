@@ -1,4 +1,26 @@
-## 3.1.1-wip
+## 3.2.0-wip
+
+* Add support for handling authentication challenges, such as TLS server
+  trust evaluation:
+  * Add an `onChallenge` callback to `URLSession.sessionWithConfiguration`,
+    `URLSession.delegate` and `URLSessionTask.delegate`.
+  * Add `URLAuthenticationChallenge`, `URLProtectionSpace`, `URLCredential`,
+    `SecTrust`, `SecCertificate` and the `NSURLAuthenticationMethod...`
+    constants (e.g. `NSURLAuthenticationMethodServerTrust`).
+* Add an `onChallenge` parameter to `CupertinoClient.fromSessionConfiguration`,
+  which makes it possible to trust servers using self-signed certificates or
+  certificates issued by a private certificate authority, or to implement
+  certificate pinning.
+* Add `URLRequest.assumesHTTP3Capable` and
+  `MutableURLRequest.assumesHTTP3Capable`.
+* Add `OnMetrics`, the `onMetrics` argument of
+  `URLSession.sessionWithConfiguration`, and `URLSessionTaskMetrics` /
+  `URLSessionTaskTransactionMetrics`, so the protocol negotiated for a request
+  (`h2`, `h3`, `http/1.1`) can be read with
+  `URLSessionTaskTransactionMetrics.networkProtocolName`.
+* Update package description and declare supported platforms (`ios`, `macos`).
+
+## 3.1.1
 
 * Update example to fetch and display scores of `package:cupertino_http` from
   pub.dev.
@@ -8,6 +30,11 @@
     * `URLRequest.fromUrl`
     * `MutableURLRequest.fromUrl`
 * Eagerly release request body data in `CupertinoClient`.
+* Mitigate a memory leak when WebSocket connections are created.
+* Fix a [bug](https://github.com/dart-lang/http/issues/1791) where native
+  memory was not being deallocated when `CupertinoClient` was used in a
+  background isolate.
+* Regenerate FFI bindings with macOS 26.5 SDK.
 
 ## 3.1.0
 

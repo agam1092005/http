@@ -1,14 +1,88 @@
-## 3.1.0
+## 3.2.1-wip
 
-- Gracefully handle receiving headers on a stream that the client has canceled. (#1799)
-- Treat incoming server push streams as connection protocol error when pushes are disabled (SETTINGS_ENABLE_PUSH=0).
+- `finish()` and `terminate()` no longer hang when a write to the socket fails
+  (for example because the peer closed the connection); previously they waited
+  for a `Socket.done` that never completes after a failed write.
+- `Http2Client` now drops a connection from its pool as soon as it is dead,
+  instead of keeping it as an idle connection no request may use, and keeps a
+  healthy connection pooled when the server resets just one of its streams.
+- Terminate the connection with `ENHANCE_YOUR_CALM` when the peer keeps sending
+  frames that require a reply - PINGs, SETTINGS frames, or frames that cause a
+  stream error, such as DATA frames on a closed stream - but does not read the
+  replies, instead of queueing them without limit (the "Ping Flood", "Settings
+  Flood" and "Reset Flood": CVE-2019-9512, CVE-2019-9515, CVE-2019-9514). At
+  most 10000 replies are queued while the transport takes no data.
+- Terminate the connection with `ENHANCE_YOUR_CALM` when the peer resets the
+  streams it opened faster than 33 per second, after a burst of 1000 (the
+  "Rapid Reset", CVE-2023-44487). A reset stream no longer counts toward the
+  concurrent stream limit, so this was not bounded otherwise.
+- Count stream errors that make this endpoint reset a peer-opened stream toward
+  the same reset rate limit, and report the reset to `onTerminated` and
+  `incomingMessages` ("MadeYouReset", CVE-2025-8671).
+- Keep counting a peer-initiated stream toward `SETTINGS_MAX_CONCURRENT_STREAMS`
+  until its outgoing `END_STREAM` frame has left the stream queue, so a peer
+  with a zero flow-control window cannot stack unsent responses past the
+  concurrent stream limit (CVE-2023-26964, CVE-2023-45802), and fix a
+  `RangeError` when sending an empty `END_STREAM` `DATA` frame with a negative
+  send window.
+- Enforce connection and stream receive windows on ignored `DATA` frames,
+  padded `DATA` frames (including `Pad Length` and `Padding`, RFC 9113
+  Section 6.1), and paused streams, and avoid queueing empty `DATA` frames
+  without `END_STREAM` while a stream is paused (CVE-2019-9518).
+- Cap `SETTINGS` parameters per frame (CVE-2020-11080), rate-limit floods of
+  control and empty frames (CVE-2019-9512, CVE-2019-9513, CVE-2019-9515,
+  CVE-2019-9518), and reject zero `WINDOW_UPDATE` increments while scoping
+  stream `WINDOW_UPDATE` overflows to `RST_STREAM` (RFC 9113 Sections 6.9 and
+  6.9.1).
+
+## 3.2.0
+
+- Add `Settings.connectionWindowSize` and `Settings.maxFrameSize` to configure
+  the connection-level receive window and `SETTINGS_MAX_FRAME_SIZE`. (#1997)
+- Apply a larger `streamWindowSize` and `maxFrameSize` to the receive side as
+  soon as they are sent, and acknowledge received data once per half window
+  when the window is at least twice 65535 bytes.
+- Honor the peer's `SETTINGS_MAX_FRAME_SIZE` when sending; the ACK of our own
+  `SETTINGS_INITIAL_WINDOW_SIZE` no longer resizes send windows.
+- Never send a WINDOW_UPDATE with an increment of 0.
+- Replenish the connection-level receive window and release active stream slots
+  when a stream with buffered unconsumed `DATA` frames is terminated, reset, or
+  its incoming subscription is cancelled.
+- Ignore `PRIORITY` and unknown extension frames on open, idle, and closed
+  streams, and treat `SETTINGS`, `PING`, and `GOAWAY` frames with a non-zero
+  stream ID as a connection-level `PROTOCOL_ERROR`.
+- Fix `sendData(..., endStream: true)` stalling forever when the data exceeds
+  the peer's flow-control window (#1998).
+- Deliver the complete response instead of a `StreamTransportException` when
+  the peer sends `RST_STREAM(NO_ERROR)` after `END_STREAM` (RFC 9113
+  Section 8.1).
+- Never write a `RST_STREAM` before the still-queued `HEADERS` of the same
+  stream when a stream is cancelled; drop the stream's queued `DATA` instead.
+- `Http2Client` propagates pausing a response body to the underlying HTTP/2
+  stream, so a slow reader stops the server at the flow-control window instead
+  of buffering the whole response in memory, and uses a 4 MiB stream / 16 MiB
+  connection receive window instead of the protocol's 64 KiB defaults.
+- Stop head-of-line blocking `HEADERS`, `RST_STREAM`, and `GOAWAY` behind
+  `DATA` that is waiting for connection-level flow-control credit.
+- `StreamException` (a stream reset because of a `GOAWAY` or oversized headers)
+  now extends `StreamTransportException`, as documented for `TransportException`
+  subclasses. `MultiProtocolHttpServer.startServing` forwards an unexpected ALPN
+  protocol to `onError` instead of throwing inside the socket listener.
 - Bound peer-initiated concurrent streams and reject peers that ignore the
   advertised `SETTINGS_MAX_CONCURRENT_STREAMS` value. Reserved peer streams
   are also bounded locally. The default limit is 100.
 - Bound inbound compressed field blocks, decoded field sections, CONTINUATION
   frame counts, and incomplete field-block duration. HPACK decoding continues
   in discard mode after the decoded limit is exceeded so the connection-wide
-  compression context remains synchronized.
+  compression context remains synchronized. By default, compressed field
+  blocks and decoded field sections are limited to 256 KiB, matching Chromium,
+  and field blocks to 64 CONTINUATION frames.
+
+## 3.1.0
+
+- Gracefully handle receiving headers on a stream that the client has canceled. (#1799)
+- Treat incoming server push streams as connection protocol error when pushes are disabled (SETTINGS_ENABLE_PUSH=0).
+- Enforce the locally advertised `SETTINGS_MAX_CONCURRENT_STREAMS` limit on incoming remote streams.
 - Add `Http2Client` (`package:http2/client.dart`), a pooled, multiplexed
   `package:http` `Client` backed by HTTP/2 connections.
 - Add `ClientTransportConnection.peerMaxConcurrentStreams`, exposing the peer's
